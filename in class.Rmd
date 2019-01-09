@@ -1,0 +1,292 @@
+---
+title: "Harry Potter and the Rvest of Fan Fiction"
+author: "Liza Bolton"
+date: "January 9, 2019"
+output:
+  html_document: default
+  html_notebook: default
+  pdf_document: default
+---
+
+## Set up
+We're going to need a package called `rvest` (rvest, harvest, geddit?) to do our web scraping, `robotstxt` and `ratelimitr` helps with some of our ethics checking, and `stringr` and `dplyr` and the rest will help with our data cleaning and other useful things.
+
+```{r set-up, message=FALSE, warning=FALSE}
+
+# install.packages("dplyr")
+# install.packages("ggplot2")
+# install.packages("lubridate")
+# install.packages("purrr")
+# install.packages("readr")
+# install.packages("robotstxt")
+# install.packages("rvest")
+# install.packages("stringr")
+# install.packages("tidyr")
+# install.packages("ratelimitr")
+
+# Main scraping package
+library(rvest)
+
+# Helpful for ethical behaviour
+library(robotstxt)
+library(ratelimitr)
+
+# Tidying data and other useful things
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(purrr)
+library(readr)
+library(stringr)
+library(tidyr)
+
+```
+
+In your browser, you can got to [https://www.fanfiction.net/robots.txt](www.fanfiction.net/robots.txt), or check what it says directly from your R session!
+```{r ethics, warning=FALSE}
+
+rt = ****
+
+# Check which areas are off limits
+rt$permissions
+
+# Any mention of a crawl delay?
+rt$crawl_delay
+
+# Is it enough to just check this?
+
+n = *** # n is the number of allowed events within a period
+p = *** # p is the length (in seconds) of measurement period
+
+```
+
+
+```{r scrape-data}
+
+# Pick which page you want to scrape - This URL takes stories of all ratings, sorted by favourites as a measure of popularity
+base_url = "****"
+
+# 1:20 indicates the pages I want
+# There are 25 stories per page, so the first 20 pages gives us the top 500 stories
+map_df(*:*, limit_rate(function(i){
+
+  pages = read_html(paste0(base_url, i))
+  
+  # The '.' before stitle and xgray indicates that it is the class
+  data.frame(title = html_text(html_nodes(pages, "****")), details=html_text(html_nodes(pages, "****")),
+             stringsAsFactors=FALSE)
+
+}, rate(n, p)) ) -> hp_data
+# ^ set rate information above in the ethics chunk
+# This will take a while so...
+
+# hp_data = read_csv("somethingIpreparedearlier.csv")
+
+# Store how many stories for graph titles later
+n_stories = dim(hp_data)[1]
+
+```
+
+## Get some helpful information from the filter menu
+This next section pulls some information from the filters menu to help up clean up the data later. See [this xpath tutorial](https://www.w3schools.com/xml/xpath_intro.asp) for more information.
+
+```{r helpful-bits}
+# Credit to Anna Fergusson for help with this code
+
+home = read_html("https://www.fanfiction.net/book/Harry-Potter/")
+
+# Get genres
+genres = home %>% 
+  html_nodes(xpath='//*[@id="myform"]/div[1]/select[3]/option') %>%
+  html_text() 
+genres = genres[-1] #delete first text value
+genresReg = paste(genres, collapse = '|')
+
+# Get the list of characters
+characters <- home %>% 
+  html_nodes(xpath='//*[@id="myform"]/div[1]/select[10]/option') %>%
+  html_text() 
+charactersReg = paste(characters, collapse = '|')
+
+# Get ratings
+ratingLevels <- c("K", "K+", "T", "M")
+
+# Useful for later
+my_counter = function(x){
+ return(length(x) - sum(str_detect(x, "Not")))
+}
+
+```
+
+## Tidy up the data
+```{r tidy-data}
+
+tidy_data = hp_data %>%
+  mutate(id = 1:n()) %>%
+  select(id,title, details) %>% 
+  separate_rows(details,sep="- ") %>%
+  separate(details,c("varName", "tempValue"), sep=":", fill="left") %>%
+  mutate(
+    newValue = str_trim(tempValue),
+    newVarName = case_when(
+      !is.na(varName) ~ varName,
+      str_detect(newValue, "Complete") ~ "Completed",
+      str_detect(newValue, genresReg) ~ "Genres",
+      str_detect(newValue, charactersReg) ~ "Characters",
+      TRUE ~ "Language"
+    )
+  ) %>% 
+  select(id, title, newVarName, newValue) %>%
+  spread(newVarName, newValue, fill = NA) %>%
+  mutate_at(vars(c("Chapters","Favs","Follows","Reviews","Words")), parse_number) %>%
+  mutate_at(vars(c("Published")), mdy) %>%
+  mutate(
+    Rating = factor(Rated, ratingLevels),
+    Completed = case_when(is.na(Completed) ~ "Not complete", 
+                          TRUE ~ "Complete"),
+    Characters = str_replace_all(Characters,c("\\[" = "","\\]" = ""))
+  )
+
+# Make columns for each genre
+
+for (ii in 1:length(genres)){
+    tidy_data = tidy_data %>%
+    mutate_(.dots = setNames(list(paste0("case_when(str_detect(Genres, \"", genres[ii], "\") ~ \"", genres[ii], "\",
+                                        TRUE ~ paste0(\"Not \", \"", genres[ii], "\"),
+                                        NA ~ paste0(\"Not \",\"", genres[ii], "\"))"
+                                        )), paste0("genre_", genres[ii])))
+}
+
+# Make columns for each character
+# This one takes a while because there are a lot of characters that could be included
+
+for (jj in 1:length(characters)){
+    tidy_data = tidy_data %>%
+    mutate_(.dots = setNames(list(paste0("case_when(str_detect(Characters, \"", characters[jj], "\") ~ \"", characters[jj], "\",
+                                        TRUE ~ paste0(\"Not \", \"", characters[jj], "\"),
+                                        NA ~ paste0(\"Not \",\"", characters[jj], "\"))"
+                                        )), paste0("character_", characters[jj])))
+}
+
+
+```
+
+## Fun stuff - let's get plottin'!
+```{r fun-stuff-genres}
+# See how many stories there are in each genre 
+
+# Set how many stories minimum must appear to be included
+appear_lim = 0
+summary_genre = tidy_data %>% 
+  select(starts_with("genre_")) %>% 
+  sapply(my_counter) %>% 
+  data.frame() %>% 
+  rename_(Counts = names(.)[1]) %>% 
+  mutate(Genre = str_split_fixed(rownames(.), "genre_", 2)[,2]) %>% 
+  filter(Counts>=appear_lim) %>% 
+  arrange(desc(Counts)) %>% 
+  ggplot(aes(x = reorder(Genre, -Counts), y = Counts)) +
+  geom_bar(stat = "identity", fill="#611c64") +
+  xlab("Genres") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle(paste("Genre popularity among stories in the top", n_stories)) +
+  geom_text(stat='identity', aes(label=Counts), vjust=-0.3)
+
+summary_genre
+
+```
+
+
+```{r fun-stuff-characters}
+# See how many stories featuring each character there are 
+
+# Set how many stories minimum they must appear in to be included
+appear_lim = 5
+summary_character = tidy_data %>% 
+  select(starts_with("character_")) %>% 
+  sapply(my_counter) %>% 
+  data.frame() %>% 
+  rename_(Counts = names(.)[1]) %>% 
+  mutate(Character = str_split_fixed(rownames(.), "character_", 2)[,2]) %>% 
+  filter(Counts>=appear_lim) %>% 
+  arrange(desc(Counts)) %>% 
+  ggplot(aes(x = reorder(Character, -Counts), y = Counts)) +
+  geom_bar(stat = "identity", fill="#611c64") +
+  xlab("Characters") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle(paste("Characters that appear in at least", appear_lim, "stories in the top", n_stories)) +
+  geom_text(stat='identity', aes(label=Counts), vjust=-0.3)
+
+summary_character
+
+```
+
+```{r fun-stuff-rating}
+
+rating = tidy_data %>% 
+  ggplot(aes(Rating)) +
+  geom_bar(fill="#611c64") +
+  ylab("Count") +
+  theme_minimal() +
+  ggtitle(paste("Ratings of stories in the top", n_stories)) +
+  geom_text(stat='count', aes(label=..count..), vjust=-0.3)
+  
+rating
+
+```
+
+```{r fun-stuff_rating_romance}
+
+rating_romance = tidy_data %>% 
+  ggplot(aes(Rating, fill=genre_Romance)) +
+  geom_bar() +
+  ylab("Count") +
+  theme_minimal() +
+  ggtitle(paste("Romance stories in each rating group in the top", n_stories)) +
+  scale_fill_discrete(name = "Romance genre")
+  
+rating_romance
+
+```
+
+```{r fun-stuff_rating_males}
+
+male_ratings = data_frame("Harry P." = xtabs(~`character_Harry P.`+Rating, data=tidy_data)[1,],
+      "Draco M." = xtabs(~`character_Draco M.`+Rating, data=tidy_data)[1,],
+      "Severus S." = xtabs(~`character_Severus S.`+Rating, data=tidy_data)[2,],
+      "Sirius B." = xtabs(~`character_Sirius B.`+Rating, data=tidy_data)[2,],
+      "Ron W."= xtabs(~`character_Ron W.`+Rating, data=tidy_data)[2,],
+      "Voldemort" = xtabs(~`character_Voldemort`+Rating, data=tidy_data)[2,]) %>% 
+  gather(Character, Rating_Count) %>% 
+  mutate(Rating = factor(rep(ratingLevels, 6), levels = c("K", "K+", "T", "M")))
+
+ggplot(male_ratings, aes(Character, Rating_Count, fill=Rating)) +
+  geom_bar(stat="identity", position = "fill") +
+  ylab("Proportion") +
+  ggtitle(paste0("Which of these male characters has the greatest proportion of the stories \nthey're featured in (in the top ", n_stories, ") rated Mature?")) +
+  theme_minimal()
+
+```
+
+```{r fun-stuff-numeric}
+
+scatterplot = tidy_data %>% 
+  filter(Published > 2000) %>% 
+  mutate(Publish_cat = case_when(
+    year(Published) < 2006 ~ "2002 - 2005",
+    year(Published) < 2010 ~ "2006 - 2009",
+    year(Published) < 2014 ~ "2010 - 2013",
+    TRUE ~ "2014 - 2017"
+  )) %>% 
+  ggplot(aes(x = Chapters, y = Favs, color = Completed)) +
+  geom_point() +
+  facet_grid(. ~ Publish_cat) +
+  theme_minimal() +
+  scale_color_discrete(name = "Completed") +
+  ggtitle("Favourites and chapters by publishing date and completion status", subtitle = paste0("Top ", n_stories, " stories by number of favourites"))
+  
+scatterplot
+
+```
